@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gravador de voz · Portal RI</title>
+<!--
+  GRAVADOR DE VOZ DO PORTAL RI
+  ----------------------------
+  Por que existe: o Google não deixa páginas do Apps Script usarem o microfone.
+  Esta página fica hospedada fora do Google (ex.: GitHub Pages), grava o áudio
+  e o entrega direto para a janela do portal que a abriu.
+
+  O que ela NÃO faz: não guarda nada, não envia o áudio para nenhum servidor.
+  O áudio só existe na memória do navegador até ser entregue ao portal.
+
+  Não precisa editar nada aqui.
+-->
+<style>
+  :root { --azul: #0b2e6b; --verde: #12a150; --verde-escuro: #0b7a3b; --vermelho: #c62828; --cinza: #5b6475; --borda: #dfe4ec; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif; background: #f4f6fa; color: #1c2433;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .cartao { background: #fff; border: 1px solid var(--borda); border-radius: 16px; padding: 28px 24px; width: 100%; max-width: 420px;
+            box-shadow: 0 8px 30px rgba(11,46,107,.08); text-align: center; }
+  h1 { font-size: 19px; color: var(--azul); margin: 0 0 4px; }
+  .sub { font-size: 13px; color: var(--cinza); margin: 0 0 22px; }
+  .tempo { font-size: 40px; font-weight: 700; color: var(--azul); font-variant-numeric: tabular-nums; margin: 6px 0 10px; }
+  .nivel { height: 8px; background: #edf0f5; border-radius: 99px; overflow: hidden; margin: 0 auto 22px; max-width: 260px; }
+  .nivel span { display: block; height: 100%; width: 0; background: var(--verde); transition: width .08s; }
+  button { font: inherit; font-weight: 700; font-size: 15px; border-radius: 12px; padding: 13px 18px; cursor: pointer; border: 1px solid transparent; width: 100%; margin-top: 10px; }
+  .gravar { background: var(--verde); color: #fff; }
+  .gravar.parar { background: var(--vermelho); }
+  .enviar { background: var(--azul); color: #fff; }
+  .sec { background: #fff; color: var(--azul); border-color: var(--borda); }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { font-size: 13px; font-weight: 600; color: var(--cinza); margin-top: 16px; min-height: 18px; }
+  .status.erro { color: var(--vermelho); }
+  .status.ok { color: var(--verde-escuro); }
+  audio { width: 100%; margin-top: 14px; }
+  .nota { font-size: 11.5px; color: var(--cinza); margin-top: 18px; line-height: 1.45; }
+</style>
+</head>
+<body>
+<div class="cartao">
+  <h1>Gravador de voz</h1>
+  <p class="sub">Portal de Relações Institucionais</p>
+  <div class="tempo" id="tempo">0:00</div>
+  <div class="nivel"><span id="nivel"></span></div>
+  <button class="gravar" id="btGravar">Começar a gravar</button>
+  <audio id="ouvir" controls hidden></audio>
+  <button class="enviar" id="btEnviar" hidden>Enviar para o portal</button>
+  <button class="sec" id="btRegravar" hidden>Gravar de novo</button>
+  <div class="status" id="status"></div>
+  <p class="nota">Fale com quem foi, quando, o que foi tratado e o que ficou combinado.<br>
+    O áudio não é guardado aqui: vai direto para o portal, que pede ao Gemini para transcrever.</p>
+</div>
+<script>
+(function () {
+  var LIMITE_SEG = 10 * 60;            // gravação máxima: 10 minutos
+  var params = new URLSearchParams(location.search);
+  var origem = params.get('origem') || '';   // endereço da janela do portal (enviado pelo próprio portal)
+  var $ = function (id) { return document.getElementById(id); };
+  var gravador = null, fluxo = null, partes = [], inicio = 0, relogio = null, analisador = null, quadro = null, gravado = null;
+
+  function status(t, tipo) { var e = $('status'); e.textContent = t || ''; e.className = 'status' + (tipo ? ' ' + tipo : ''); }
+  function mmss(s) { s = Math.floor(s); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+
+  if (!window.opener || !origem) {
+    $('btGravar').disabled = true;
+    status('Abra esta página pelo botão "Falar" do portal.', 'erro');
+    return;
+  }
+  if (!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    $('btGravar').disabled = true;
+    status('Este navegador não grava áudio. Use o Chrome, o Edge ou o Safari atualizados.', 'erro');
+    return;
+  }
+
+  function medirNivel() {
+    if (!analisador) return;
+    var dados = new Uint8Array(analisador.fftSize);
+    analisador.getByteTimeDomainData(dados);
+    var pico = 0;
+    for (var i = 0; i < dados.length; i++) pico = Math.max(pico, Math.abs(dados[i] - 128));
+    $('nivel').style.width = Math.min(100, pico / 64 * 100) + '%';
+    quadro = requestAnimationFrame(medirNivel);
+  }
+
+  function comecar() {
+    status('Pedindo acesso ao microfone…');
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (f) {
+      fluxo = f; partes = [];
+      var tipos = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
+      var tipo = tipos.filter(function (t) { return MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t); })[0] || '';
+      gravador = tipo ? new MediaRecorder(fluxo, { mimeType: tipo, audioBitsPerSecond: 32000 }) : new MediaRecorder(fluxo);
+      gravador.ondataavailable = function (e) { if (e.data && e.data.size) partes.push(e.data); };
+      gravador.onstop = terminou;
+      gravador.start(1000);
+      try {
+        var ctx = new (window.AudioContext || window.webkitAudioContext)();
+        analisador = ctx.createAnalyser(); analisador.fftSize = 512;
+        ctx.createMediaStreamSource(fluxo).connect(analisador); medirNivel();
+      } catch (e) { /* o medidor é só visual */ }
+      inicio = Date.now();
+      relogio = setInterval(function () {
+        var seg = (Date.now() - inicio) / 1000;
+        $('tempo').textContent = mmss(seg);
+        if (seg >= LIMITE_SEG) parar();
+      }, 250);
+      $('btGravar').textContent = 'Parar'; $('btGravar').classList.add('parar');
+      status('Gravando… fale normalmente.');
+    }).catch(function (err) {
+      var n = err && err.name;
+      if (n === 'NotAllowedError' || n === 'SecurityError') status('O microfone foi bloqueado. Clique no cadeado ao lado do endereço › Microfone › Permitir, e tente de novo.', 'erro');
+      else if (n === 'NotFoundError') status('Nenhum microfone encontrado. Confira se o fone ou o microfone está conectado.', 'erro');
+      else status('Não foi possível ligar o microfone (' + (n || err) + ').', 'erro');
+    });
+  }
+
+  function parar() { if (gravador && gravador.state !== 'inactive') gravador.stop(); }
+
+  function terminou() {
+    clearInterval(relogio); cancelAnimationFrame(quadro); $('nivel').style.width = '0';
+    if (fluxo) fluxo.getTracks().forEach(function (t) { t.stop(); });
+    var tipo = (gravador.mimeType || 'audio/webm').split(';')[0];
+    var blob = new Blob(partes, { type: tipo });
+    var segundos = (Date.now() - inicio) / 1000;
+    $('btGravar').hidden = true;
+    if (!blob.size) { status('Não captei nenhum áudio. Tente de novo.', 'erro'); $('btRegravar').hidden = false; return; }
+    gravado = { blob: blob, tipo: tipo, segundos: segundos };
+    $('ouvir').src = URL.createObjectURL(blob); $('ouvir').hidden = false;
+    $('btEnviar').hidden = false; $('btRegravar').hidden = false;
+    status('Pronto. Ouça se quiser e clique em "Enviar para o portal".', 'ok');
+  }
+
+  function enviar() {
+    if (!gravado) return;
+    if (!window.opener || window.opener.closed) { status('A janela do portal foi fechada. Abra o portal de novo e clique em "Falar".', 'erro'); return; }
+    $('btEnviar').disabled = true;
+    var leitor = new FileReader();
+    leitor.onload = function () {
+      window.opener.postMessage({
+        tipo: 'portal-ri-audio',
+        base64: String(leitor.result).split(',')[1],
+        mimeType: gravado.tipo,
+        segundos: gravado.segundos,
+      }, origem);
+      status('Enviado! Volte ao portal e clique em "Preencher campos".', 'ok');
+      setTimeout(function () { window.close(); }, 900);
+    };
+    leitor.readAsDataURL(gravado.blob);
+  }
+
+  $('btGravar').onclick = function () { if (gravador && gravador.state === 'recording') parar(); else comecar(); };
+  $('btEnviar').onclick = enviar;
+  $('btRegravar').onclick = function () {
+    gravado = null; $('ouvir').hidden = true; $('btEnviar').hidden = true; $('btEnviar').disabled = false;
+    $('btRegravar').hidden = true; $('btGravar').hidden = false; $('btGravar').textContent = 'Começar a gravar';
+    $('btGravar').classList.remove('parar'); $('tempo').textContent = '0:00'; comecar();
+  };
+})();
+</script>
+</body>
+</html>
